@@ -149,9 +149,13 @@ def prompt_for_operation_args():
         if write_all == 'yes':
             data = input(Fore.YELLOW + "Enter the data to write (comma-separated for coils or space-separated for holding registers): ")
             if register_type == 'coils':
-                values = [bool(int(val)) for val in data.split(',')]
+                try:
+                    values = [bool(int(val)) for val in data.split(',')]
+                except ValueError:
+                    print(Fore.RED + "Invalid data for coils. Enter comma-separated 0 or 1 values.")
+                    return prompt_for_operation_args()
             else:
-                values = [ord(char) for char in data]
+                values = [ord(char) for char in ' '.join(data.split())]
             return {'action': action, 'type': register_type, 'write_all': True, 'values': values}
         else:
             while True:
@@ -163,15 +167,19 @@ def prompt_for_operation_args():
 
             data = input(Fore.YELLOW + "Enter the data to write (comma-separated for coils or space-separated for holding registers): ")
             if register_type == 'coils':
-                values = [bool(int(val)) for val in data.split(',')]
+                try:
+                    values = [bool(int(val)) for val in data.split(',')]
+                except ValueError:
+                    print(Fore.RED + "Invalid data for coils. Enter comma-separated 0 or 1 values.")
+                    return prompt_for_operation_args()
             else:
-                values = [ord(char) for char in data]
+                values = [ord(char) for char in ' '.join(data.split())]
 
             return {'action': action, 'type': register_type, 'address': address, 'values': values}
 
     elif action == 'scan':
         return {'action': action}
-    
+
     elif action == 'bruteforce':
         return {'action': action}
 
@@ -206,8 +214,8 @@ def decode_holding_registers(registers):
     except:
         return "Unable to decode"
 
-def generate_filename(ip_address, extension):
-    base_filename = f"{ip_address}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+def generate_filename(ip_address, command, extension):
+    base_filename = f"{ip_address}_{command}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     counter = 1
     filename = f"{base_filename}.{extension}"
     while os.path.exists(os.path.join('csv' if extension == 'csv' else 'json', filename)):
@@ -284,8 +292,8 @@ def read_all_data(client, unit_id, ip_address):
             ["Holding Registers", holding_registers_data]
         ]
 
-        csv_filename = os.path.join('csv', generate_filename(ip_address, 'csv'))
-        json_filename = os.path.join('json', generate_filename(ip_address, 'json'))
+        csv_filename = os.path.join('csv', generate_filename(ip_address, 'read_all', 'csv'))
+        json_filename = os.path.join('json', generate_filename(ip_address, 'read_all', 'json'))
 
         save_data_to_csv(csv_filename, data)
         save_data_to_json(json_filename, data)
@@ -300,6 +308,9 @@ def read_all_data(client, unit_id, ip_address):
 
         print(Fore.CYAN + "Translated Data:")
         print(table)
+
+        translated_json_filename = os.path.join('json', generate_filename(ip_address, 'read_all_translated', 'json'))
+        save_data_to_json(translated_json_filename, translated_data)
 
     except ModbusException as e:
         print(Fore.RED + f"Failed to read all data: {e}")
@@ -342,30 +353,46 @@ def scan_modbus_unit_ids(ip_address, port, from_unit, to_unit, max_concurrent_ta
         for unit_id in range(from_unit, to_unit + 1)
     ]
 
-    loop.run_until_complete(asyncio.gather(*tasks))
+    try:
+        loop.run_until_complete(asyncio.gather(*tasks))
+    except KeyboardInterrupt:
+        print(Fore.YELLOW + "\nScan interrupted by user.")
 
     if results:
-        json_filename = os.path.join('json', generate_filename(ip_address, 'json'))
-        save_data_to_json(json_filename, results)
+        json_filename = os.path.join('json', generate_filename(ip_address, 'scan', 'json'))
+        save_data_to_json(json_filename, {"valid_unit_ids": results})
         print(Fore.CYAN + f"Valid Unit IDs saved to {json_filename}")
     else:
         print(Fore.RED + "No valid Unit IDs found")
 
-def brute_force_function_codes(ip, port, unit_id, start_code, end_code):
-    client = get_modbus_client(ip, port)
-    client.connect()
-    valid_codes = []
-
-    for code in range(start_code, end_code + 1):
+async def brute_force_function_codes_async(ip_address, port, unit_id, function_code, semaphore, results):
+    async with semaphore:
+        client = get_modbus_client(ip_address, port)
         try:
-            response = client.execute(client._execute(code, unit=unit_id))
-            if not response.isError():
-                valid_codes.append(code)
+            client.connect()
+            request = client.execute(client.framer.buildRequest(function_code, unit_id))
+            client.close()
+            if not request.isError():
+                results.append(function_code)
         except Exception:
             pass
 
-    client.close()
-    return valid_codes
+def brute_force_function_codes(ip_address, port, unit_id, start_code, end_code, max_concurrent_tasks=10):
+    semaphore = asyncio.Semaphore(max_concurrent_tasks)
+    results = []
+    loop = asyncio.get_event_loop()
+
+    tasks = [
+        brute_force_function_codes_async(ip_address, port, unit_id, function_code, semaphore, results)
+        for function_code in range(start_code, end_code + 1)
+    ]
+
+    try:
+        loop.run_until_complete(asyncio.gather(*tasks))
+    except KeyboardInterrupt:
+        print(Fore.YELLOW + "\nBrute force interrupted by user.")
+
+    return results
 
 def main():
     parser = argparse.ArgumentParser(description="Modbus Client Script")
@@ -431,12 +458,15 @@ def main():
                     elif action == 'scan':
                         scan_modbus_unit_ids(args.ip, args.port, args.unit_id_from, args.unit_id_to, args.max_concurrent_tasks, args.timeout)
                     elif action == 'bruteforce':
-                        start_code = int(input(Fore.YELLOW + "Enter the start function code (default 1): ") or 1)
-                        end_code = int(input(Fore.YELLOW + "Enter the end function code (default 127): ") or 127)
-                        valid_codes = brute_force_function_codes(args.ip, args.port, args.unit, start_code, end_code)
-                        json_filename = os.path.join('json', generate_filename(args.ip, 'json'))
-                        save_data_to_json(json_filename, {"valid_function_codes": valid_codes})
-                        print(Fore.CYAN + f"Valid Function Codes saved to {json_filename}")
+                        start_code = int(input(Fore.YELLOW + "Enter the starting function code (default 1): ") or 1)
+                        end_code = int(input(Fore.YELLOW + "Enter the ending function code (default 255): ") or 255)
+                        results = brute_force_function_codes(args.ip, args.port, args.unit, start_code, end_code, args.max_concurrent_tasks)
+                        if results:
+                            json_filename = os.path.join('json', generate_filename(args.ip, 'bruteforce', 'json'))
+                            save_data_to_json(json_filename, {"valid_function_codes": results})
+                            print(Fore.CYAN + f"Valid function codes saved to {json_filename}")
+                        else:
+                            print(Fore.RED + "No valid function codes found")
                 except ValueError as e:
                     print(Fore.RED + f"Value error: {e}")
                 except ModbusException as e:
