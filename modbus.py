@@ -1,7 +1,6 @@
 import logging
 from pymodbus.client import ModbusTcpClient
 from pymodbus.exceptions import ConnectionException, ModbusException
-from pymodbus.pdu import ExceptionResponse
 from colorama import init, Fore, Style
 import argparse
 import readline
@@ -10,13 +9,7 @@ from datetime import datetime
 import os
 import csv
 import json
-import random
-import socket
-import secrets
-import threading
-from time import sleep
-from queue import Queue
-from scapy.all import ARP, send
+import asyncio
 
 # Initialize colorama
 init(autoreset=True)
@@ -48,8 +41,8 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # Set up tab completion
-commands = ['read', 'write', 'exit']
-register_types = ['coils', 'discrete_inputs', 'input_registers', 'holding_registers']
+commands = ['read', 'write', 'scan', 'bruteforce', 'exit']
+register_types = ['coils', 'discrete_inputs', 'input_registers', 'holding_registers', 'all']
 
 def completer(text, state):
     options = [cmd for cmd in commands + register_types if cmd.startswith(text)]
@@ -83,9 +76,13 @@ def write_registers(client, register_type, address, values, unit_id):
     else:
         raise ValueError("Can only write to coils or holding registers")
 
-def validate_register_type(register_type):
-    if register_type not in register_types:
-        raise ValueError("Invalid register type. Must be one of: coils, discrete_inputs, input_registers, holding_registers")
+def validate_register_type(register_type, action):
+    if action == 'read':
+        if register_type not in register_types:
+            raise ValueError("Invalid register type. Must be one of: coils, discrete_inputs, input_registers, holding_registers, all")
+    elif action == 'write':
+        if register_type not in ['coils', 'holding_registers']:
+            raise ValueError("Invalid register type. Must be one of: coils, holding_registers")
 
 def validate_positive_integer(value, field_name):
     try:
@@ -98,62 +95,85 @@ def validate_positive_integer(value, field_name):
 
 def prompt_for_operation_args():
     while True:
-        action = input(Fore.YELLOW + "Do you want to read or write registers? (read/write/exit): ").strip().lower()
-        if action in ['read', 'write', 'exit']:
+        action = input(Fore.YELLOW + "Do you want to read, write, scan for unit IDs, brute force function codes, or exit? (read/write/scan/bruteforce/exit): ").strip().lower()
+        if action in ['read', 'write', 'scan', 'bruteforce', 'exit']:
             break
-        print(Fore.RED + "Invalid option. Please enter 'read', 'write', or 'exit'.")
+        print(Fore.RED + "Invalid option. Please enter 'read', 'write', 'scan', 'bruteforce', or 'exit'.")
 
     if action == 'exit':
         return None
     elif action == 'read':
-        print(Fore.GREEN + "Recommended register types: coils, discrete_inputs, input_registers, holding_registers")
+        print(Fore.GREEN + "Recommended register types: coils, discrete_inputs, input_registers, holding_registers, all")
         while True:
             try:
                 register_type = input(Fore.YELLOW + "Enter register type: ").strip().lower()
-                validate_register_type(register_type)
-                break
-            except ValueError as e:
-                print(Fore.RED + str(e))
-        
-        while True:
-            try:
-                address = validate_positive_integer(input(Fore.YELLOW + "Enter the starting address (default 0): ") or 0, "address")
-                break
-            except ValueError as e:
-                print(Fore.RED + str(e))
-        
-        while True:
-            try:
-                count = validate_positive_integer(input(Fore.YELLOW + "Enter the number of registers to read (default 1): ") or 1, "count")
+                validate_register_type(register_type, action)
                 break
             except ValueError as e:
                 print(Fore.RED + str(e))
 
-        return {'action': action, 'type': register_type, 'address': address, 'count': count}
+        if register_type != "all":
+            read_all = input(Fore.YELLOW + "Do you want to read all addresses and number of registers? (yes/no): ").strip().lower()
+            if read_all == 'yes':
+                return {'action': action, 'type': register_type, 'read_all': True}
+            else:
+                while True:
+                    try:
+                        address = validate_positive_integer(input(Fore.YELLOW + "Enter the starting address (default 0): ") or 0, "address")
+                        break
+                    except ValueError as e:
+                        print(Fore.RED + str(e))
+
+                while True:
+                    try:
+                        count = validate_positive_integer(input(Fore.YELLOW + "Enter the number of registers to read (default 1): ") or 1, "count")
+                        break
+                    except ValueError as e:
+                        print(Fore.RED + str(e))
+
+                return {'action': action, 'type': register_type, 'address': address, 'count': count}
+        else:
+            return {'action': action, 'type': register_type}
+
     elif action == 'write':
         print(Fore.GREEN + "Recommended register types: coils, holding_registers")
         while True:
             try:
                 register_type = input(Fore.YELLOW + "Enter register type: ").strip().lower()
-                validate_register_type(register_type)
-                if register_type not in ['coils', 'holding_registers']:
-                    print(Fore.RED + "Can only write to coils or holding registers.")
-                    continue
+                validate_register_type(register_type, action)
                 break
             except ValueError as e:
                 print(Fore.RED + str(e))
 
-        while True:
-            try:
-                address = validate_positive_integer(input(Fore.YELLOW + "Enter the starting address (default 0): ") or 0, "address")
-                break
-            except ValueError as e:
-                print(Fore.RED + str(e))
+        write_all = input(Fore.YELLOW + "Do you want to write to all addresses and number of registers? (yes/no): ").strip().lower()
+        if write_all == 'yes':
+            data = input(Fore.YELLOW + "Enter the data to write (comma-separated for coils or space-separated for holding registers): ")
+            if register_type == 'coils':
+                values = [bool(int(val)) for val in data.split(',')]
+            else:
+                values = [ord(char) for char in data]
+            return {'action': action, 'type': register_type, 'write_all': True, 'values': values}
+        else:
+            while True:
+                try:
+                    address = validate_positive_integer(input(Fore.YELLOW + "Enter the starting address (default 0): ") or 0, "address")
+                    break
+                except ValueError as e:
+                    print(Fore.RED + str(e))
 
-        data = input(Fore.YELLOW + "Enter the data to write (e.g., 'John' for holding registers): ")
-        values = [ord(char) for char in data] if register_type == 'holding_registers' else [bool(int(char)) for char in data]
+            data = input(Fore.YELLOW + "Enter the data to write (comma-separated for coils or space-separated for holding registers): ")
+            if register_type == 'coils':
+                values = [bool(int(val)) for val in data.split(',')]
+            else:
+                values = [ord(char) for char in data]
 
-        return {'action': action, 'type': register_type, 'address': address, 'values': values}
+            return {'action': action, 'type': register_type, 'address': address, 'values': values}
+
+    elif action == 'scan':
+        return {'action': action}
+    
+    elif action == 'bruteforce':
+        return {'action': action}
 
 def parse_written_data(data):
     hex_values = data.split()
@@ -161,10 +181,15 @@ def parse_written_data(data):
     return ''.join(ascii_chars)
 
 def decode_hex_response(hex_data):
+    if isinstance(hex_data, int):
+        return chr(hex_data)
     if hex_data.startswith("0x"):
         hex_data = hex_data[2:]
     bytes_data = bytes.fromhex(hex_data)
-    return bytes_data.decode('utf-8', errors='ignore')
+    try:
+        return bytes_data.decode('utf-8', errors='ignore')
+    except UnicodeDecodeError as e:
+        return f"Unable to decode hex data: {e}"
 
 def translate_modbus_response(response):
     if response.isError():
@@ -214,34 +239,40 @@ def format_data(register_type, data):
         return [data]
     return data
 
+def truncate_data(data, length=100):
+    data_str = str(data)
+    if len(data_str) > length:
+        return data_str[:length] + '...'
+    return data_str
+
 def read_all_data(client, unit_id, ip_address):
     print(Fore.YELLOW + "Reading all data from Modbus device...")
-    
+
     try:
         # Read Coils
-        coils_response = client.read_coils(0, 16, unit=unit_id)
+        coils_response = client.read_coils(0, 128, unit=unit_id)
         coils_data = format_data('coils', coils_response.bits if not coils_response.isError() else "Error reading coils")
 
         # Read Discrete Inputs
-        discrete_inputs_response = client.read_discrete_inputs(0, 16, unit=unit_id)
+        discrete_inputs_response = client.read_discrete_inputs(0, 128, unit=unit_id)
         discrete_inputs_data = format_data('discrete_inputs', discrete_inputs_response.bits if not discrete_inputs_response.isError() else "Error reading discrete inputs")
 
         # Read Input Registers
-        input_registers_response = client.read_input_registers(0, 10, unit=unit_id)
+        input_registers_response = client.read_input_registers(0, 100, unit=unit_id)
         input_registers_data = format_data('input_registers', input_registers_response.registers if not input_registers_response.isError() else "Error reading input registers")
 
         # Read Holding Registers
-        holding_registers_response = client.read_holding_registers(0, 10, unit=unit_id)
+        holding_registers_response = client.read_holding_registers(0, 100, unit=unit_id)
         holding_registers_data = format_data('holding_registers', holding_registers_response.registers if not holding_registers_response.isError() else "Error reading holding registers")
 
         # Display data in human-readable format
         table = PrettyTable(["Register Type", "Data"])
         table.align["Register Type"] = "l"
         table.align["Data"] = "l"
-        table.add_row(["Coils", coils_data])
-        table.add_row(["Discrete Inputs", discrete_inputs_data])
-        table.add_row(["Input Registers", input_registers_data])
-        table.add_row(["Holding Registers", f"{holding_registers_data} ({decode_holding_registers(holding_registers_data)})"])
+        table.add_row(["Coils", truncate_data(coils_data)])
+        table.add_row(["Discrete Inputs", truncate_data(discrete_inputs_data)])
+        table.add_row(["Input Registers", truncate_data(input_registers_data)])
+        table.add_row(["Holding Registers", truncate_data(holding_registers_data)])
 
         print(Fore.CYAN + table.get_string())
 
@@ -259,15 +290,93 @@ def read_all_data(client, unit_id, ip_address):
         save_data_to_csv(csv_filename, data)
         save_data_to_json(json_filename, data)
 
+        # Translate hex values to English values
+        translated_data = translate_hex_values(data)
+        table = PrettyTable(["Register Type", "Translated Data"])
+        table.align["Register Type"] = "l"
+        table.align["Translated Data"] = "l"
+        for item in translated_data:
+            table.add_row([item[0], truncate_data(item[1])])
+
+        print(Fore.CYAN + "Translated Data:")
+        print(table)
+
     except ModbusException as e:
         print(Fore.RED + f"Failed to read all data: {e}")
 
+def translate_hex_values(data):
+    translated_data = []
+    for item in data:
+        register_type = item[0]
+        if register_type in ['Coils', 'Discrete Inputs']:
+            translated_data.append([register_type, [bool(bit) for bit in item[1]]])
+        elif register_type == 'Input Registers' or register_type == 'Holding Registers':
+            translated_values = []
+            for val in item[1]:
+                if isinstance(val, int):
+                    translated_values.append(chr(val))
+                else:
+                    translated_values.append(decode_hex_response(val))
+            translated_data.append([register_type, translated_values])
+    return translated_data
+
+async def scan_modbus_unit_ids_async(ip_address, port, unit_id, semaphore, results):
+    async with semaphore:
+        client = get_modbus_client(ip_address, port)
+        try:
+            client.connect()
+            request = client.read_input_registers(0, 1, unit=unit_id)
+            client.close()
+            if not request.isError():
+                results.append(unit_id)
+        except Exception:
+            pass
+
+def scan_modbus_unit_ids(ip_address, port, from_unit, to_unit, max_concurrent_tasks, timeout):
+    semaphore = asyncio.Semaphore(max_concurrent_tasks)
+    results = []
+    loop = asyncio.get_event_loop()
+
+    tasks = [
+        scan_modbus_unit_ids_async(ip_address, port, unit_id, semaphore, results)
+        for unit_id in range(from_unit, to_unit + 1)
+    ]
+
+    loop.run_until_complete(asyncio.gather(*tasks))
+
+    if results:
+        json_filename = os.path.join('json', generate_filename(ip_address, 'json'))
+        save_data_to_json(json_filename, results)
+        print(Fore.CYAN + f"Valid Unit IDs saved to {json_filename}")
+    else:
+        print(Fore.RED + "No valid Unit IDs found")
+
+def brute_force_function_codes(ip, port, unit_id, start_code, end_code):
+    client = get_modbus_client(ip, port)
+    client.connect()
+    valid_codes = []
+
+    for code in range(start_code, end_code + 1):
+        try:
+            response = client.execute(client._execute(code, unit=unit_id))
+            if not response.isError():
+                valid_codes.append(code)
+        except Exception:
+            pass
+
+    client.close()
+    return valid_codes
+
 def main():
     parser = argparse.ArgumentParser(description="Modbus Client Script")
-    
+
     parser.add_argument('--ip', type=str, help="Modbus device IP address")
     parser.add_argument('--port', type=int, help="Modbus device port (default: 502)")
     parser.add_argument('--unit', type=int, help="Modbus device unit ID (default: 1)")
+    parser.add_argument('--unit-id-from', type=int, default=1, help="Modbus Unit ID start range")
+    parser.add_argument('--unit-id-to', type=int, default=247, help="Modbus Unit ID end range")
+    parser.add_argument('--max-concurrent-tasks', type=int, default=10, help="Maximum number of concurrent tasks")
+    parser.add_argument('--timeout', type=int, default=2, help="Timeout for the network probe, 0 means no timeout")
 
     args = parser.parse_args()
 
@@ -279,39 +388,55 @@ def main():
         args.unit = int(input(Fore.YELLOW + "Enter the Modbus device unit ID (default 1): ") or 1)
 
     client = get_modbus_client(args.ip, args.port)
-    
+
     try:
         connection = client.connect()
         if connection:
             print(Fore.GREEN + "Connected to Modbus device.")
-            
+
             # Read all data from the Modbus device
             read_all_data(client, args.unit, args.ip)
-            
+
             while True:
                 operation_args = prompt_for_operation_args()
                 if operation_args is None:
                     print(Fore.YELLOW + "Exiting program.")
                     break
-                
+
                 action = operation_args['action']
                 try:
                     if action == 'read':
-                        response = read_registers(client, operation_args['type'], operation_args['address'], operation_args['count'], args.unit)
-                        if not response.isError():
-                            print(Fore.CYAN + translate_modbus_response(response))
-                            print(Fore.CYAN + f"Hex data: {response}")
+                        if operation_args['type'] == 'all':
+                            read_all_data(client, args.unit, args.ip)
                         else:
-                            print(Fore.RED + f"Error reading registers: {response}")
+                            if operation_args.get('read_all'):
+                                response = read_registers(client, operation_args['type'], 0, 65535, args.unit)
+                            else:
+                                response = read_registers(client, operation_args['type'], operation_args['address'], operation_args['count'], args.unit)
+                            if not response.isError():
+                                print(Fore.CYAN + translate_modbus_response(response))
+                                print(Fore.CYAN + "----------------------------------------")
+                                print(Fore.CYAN + f"Hex data: {response}")
+                            else:
+                                print(Fore.RED + f"Error reading registers: {response}")
                     elif action == 'write':
-                        response = write_registers(client, operation_args['type'], operation_args['address'], operation_args['values'], args.unit)
+                        if operation_args.get('write_all'):
+                            response = write_registers(client, operation_args['type'], 0, operation_args['values'], args.unit)
+                        else:
+                            response = write_registers(client, operation_args['type'], operation_args['address'], operation_args['values'], args.unit)
                         if not response.isError():
-                            hex_data = ' '.join([f"0x{ord(char):02x}" for char in operation_args['data']])
-                            parsed_data = parse_written_data(hex_data)
-                            print(Fore.CYAN + f"Data written successfully. Hex data: {hex_data}")
-                            print(Fore.CYAN + f"Parsed data: {parsed_data}")
+                            print(Fore.CYAN + f"Data written successfully.")
                         else:
                             print(Fore.RED + f"Error writing data: {response}")
+                    elif action == 'scan':
+                        scan_modbus_unit_ids(args.ip, args.port, args.unit_id_from, args.unit_id_to, args.max_concurrent_tasks, args.timeout)
+                    elif action == 'bruteforce':
+                        start_code = int(input(Fore.YELLOW + "Enter the start function code (default 1): ") or 1)
+                        end_code = int(input(Fore.YELLOW + "Enter the end function code (default 127): ") or 127)
+                        valid_codes = brute_force_function_codes(args.ip, args.port, args.unit, start_code, end_code)
+                        json_filename = os.path.join('json', generate_filename(args.ip, 'json'))
+                        save_data_to_json(json_filename, {"valid_function_codes": valid_codes})
+                        print(Fore.CYAN + f"Valid Function Codes saved to {json_filename}")
                 except ValueError as e:
                     print(Fore.RED + f"Value error: {e}")
                 except ModbusException as e:
